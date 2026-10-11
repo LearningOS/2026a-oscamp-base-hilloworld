@@ -103,7 +103,7 @@ impl Sv39PageTable {
     /// 提示：右移 (12 + level * 9) 位，然后与 0x1FF 做掩码。
     pub fn extract_vpn(va: u64, level: usize) -> usize {
         // TODO: 从虚拟地址中提取指定级别的 VPN 索引
-        todo!()
+        ((va >> (12 + level * 9)) & 0x1FF) as usize
     }
 
     /// 建立从虚拟页到物理页的映射（4KB 页）。
@@ -119,7 +119,36 @@ impl Sv39PageTable {
         // 对于中间层级（level 2 和 level 1），如果对应 VPN 的页表项（PTE）无效（PTE_V == 0），
         // 则需要分配一个新的页表节点（使用 alloc_node），并将新节点的 PPN 写入当前 PTE（仅设置 PTE_V 标志）。
         // 最后在 level 0 的 PTE 中写入目标物理页号（pa >> 12）和 flags。
-        todo!()
+        let mut ppn = self.root_ppn;
+
+        // Walk down through level 2 then level 1, creating nodes as needed.
+        for level in [2usize, 1] {
+            let vpn = Self::extract_vpn(va, level);
+            let existing = self
+                .nodes
+                .get(&ppn)
+                .expect("page table node missing")
+                .entries[vpn];
+
+            if existing & PTE_V == 0 {
+                let new_ppn = self.alloc_node();
+                self.nodes
+                    .get_mut(&ppn)
+                    .expect("page table node missing")
+                    .entries[vpn] = (new_ppn << PPN_SHIFT) | PTE_V;
+                ppn = new_ppn;
+            } else {
+                ppn = existing >> PPN_SHIFT;
+            }
+        }
+
+        // Install the leaf PTE at level 0.
+        let vpn0 = Self::extract_vpn(va, 0);
+        let leaf = ((pa >> 12) << PPN_SHIFT) | flags | PTE_V;
+        self.nodes
+            .get_mut(&ppn)
+            .expect("page table node missing")
+            .entries[vpn0] = leaf;
     }
 
     /// 遍历三级页表，将虚拟地址翻译为物理地址。
@@ -141,7 +170,42 @@ impl Sv39PageTable {
         // 如果 PTE 是叶节点（即 R、W、X 标志位中有至少一个被置位），则可以直接使用该 PTE 中的物理页号（PPN）计算最终的物理地址。
         // 否则，该 PTE 指向下一级页表节点，继续遍历下一级。
         // 遍历到 level 0 时，PTE 必须是叶节点。
-        todo!()
+        let mut ppn = self.root_ppn;
+
+        for level in [2usize, 1, 0] {
+            let node = match self.nodes.get(&ppn) {
+                Some(node) => node,
+                None => return TranslateResult::PageFault,
+            };
+
+            let vpn = Self::extract_vpn(va, level);
+            let pte = node.entries[vpn];
+
+            if pte & PTE_V == 0 {
+                return TranslateResult::PageFault;
+            }
+
+            // A leaf PTE (any of R/W/X set) ends the walk.
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                let leaf_ppn = pte >> PPN_SHIFT;
+                // Level 1 leaf = 2MB superpage: offset covers VPN[0] + page offset.
+                let offset = if level == 0 {
+                    va & (PAGE_SIZE as u64 - 1)
+                } else {
+                    va & ((1u64 << 21) - 1)
+                };
+                return TranslateResult::Ok((leaf_ppn << 12) | offset);
+            }
+
+            if level == 0 {
+                // Level 0 must be a leaf; a non-leaf entry here is invalid.
+                return TranslateResult::PageFault;
+            }
+
+            ppn = pte >> PPN_SHIFT;
+        }
+
+        TranslateResult::PageFault
     }
 
     /// 建立大页映射（2MB superpage，在 level 1 设叶子 PTE）。
@@ -160,7 +224,34 @@ impl Sv39PageTable {
         // 你需要在 level 2 找到或创建中间页表节点，然后在 level 1 写入叶子 PTE。
         // 注意大页的物理页号计算方式与普通页相同（pa >> 12），
         // 但翻译时 offset 包含虚拟地址的低 21 位（VPN[0] 部分 + 12 位页内偏移）。
-        todo!()
+        let mut ppn = self.root_ppn;
+
+        // Only level 2 needs an intermediate node.
+        let vpn2 = Self::extract_vpn(va, 2);
+        let existing = self
+            .nodes
+            .get(&ppn)
+            .expect("page table node missing")
+            .entries[vpn2];
+
+        if existing & PTE_V == 0 {
+            let new_ppn = self.alloc_node();
+            self.nodes
+                .get_mut(&ppn)
+                .expect("page table node missing")
+                .entries[vpn2] = (new_ppn << PPN_SHIFT) | PTE_V;
+            ppn = new_ppn;
+        } else {
+            ppn = existing >> PPN_SHIFT;
+        }
+
+        // Write the level-1 leaf PTE for the 2MB superpage.
+        let vpn1 = Self::extract_vpn(va, 1);
+        let leaf = ((pa >> 12) << PPN_SHIFT) | flags | PTE_V;
+        self.nodes
+            .get_mut(&ppn)
+            .expect("page table node missing")
+            .entries[vpn1] = leaf;
     }
 }
 
